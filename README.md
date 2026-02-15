@@ -21,9 +21,10 @@
   - 如果当天时间已过，会自动排到次日。
 
 - **InstallTask.ps1**
-  - 安装/更新每日刷新任务：`\AutoTheme\AutoThemeSwitcher-Refresh`。
+  - 安装/更新每日刷新任务：`\AutoTheme\AutoThemeSwitcher-Refresh`（若无法创建文件夹则回退到根路径 `\`）。
   - 触发器：
-    - 开机延迟 30 秒
+    - 管理员运行：开机延迟 30 秒
+    - 非管理员运行：当前用户登录时
     - 每日 00:05 刷新
   - 可选参数 `-RunNow`：立即运行一次刷新。
 
@@ -59,6 +60,11 @@
 
 - Windows 10/11
 - PowerShell 5.1+
+
+## 注意事项
+
+- 若希望使用“开机触发”，建议以管理员权限运行 `InstallTask.ps1`。
+- 若无法创建 `\AutoTheme\` 任务文件夹，会自动回退到根路径 `\`。
 
 ## 备注
 

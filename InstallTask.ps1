@@ -14,14 +14,15 @@ Write-Host ""
 $taskPath = '\AutoTheme\'
 $refreshTaskName = "AutoThemeSwitcher-Refresh"
 $scriptPath = "$PSScriptRoot\UpdateSchedule.ps1"
+$isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
-# 检查脚本是否存在
+# Check script exists
 if (-not (Test-Path $scriptPath)) {
     Write-Host "ERROR: Script not found: $scriptPath" -ForegroundColor Red
     exit
 }
 
-# 确保任务文件夹存在（Task Scheduler COM）
+# Ensure task folder exists (Task Scheduler COM)
 function Ensure-TaskFolder {
     param([string]$Path)
 
@@ -34,15 +35,22 @@ function Ensure-TaskFolder {
             try { $root.GetFolder('\\' + $folderName) | Out-Null }
             catch { $root.CreateFolder($folderName, $null) | Out-Null }
         }
+
+        return $true
     }
     catch {
         Write-Host "WARNING: Failed to create task folder $Path" -ForegroundColor Yellow
+        return $false
     }
 }
 
-Ensure-TaskFolder -Path $taskPath
+$folderReady = Ensure-TaskFolder -Path $taskPath
+if (-not $folderReady) {
+    Write-Host "Fallback: use root task path '\'" -ForegroundColor Yellow
+    $taskPath = '\'
+}
 
-# 删除旧任务
+# Remove existing task
 $existingTask = Get-ScheduledTask -TaskName $refreshTaskName -TaskPath $taskPath -ErrorAction SilentlyContinue
 if ($existingTask) {
     Write-Host "Removing existing task..." -ForegroundColor Yellow
@@ -54,10 +62,16 @@ $action = New-ScheduledTaskAction `
     -Execute "PowerShell.exe" `
     -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`""
 
-# 触发器1: 开机启动（延迟30秒）
-Write-Host "Setting up Trigger 1: At startup (delay 30s)..." -ForegroundColor Yellow
-$trigger1 = New-ScheduledTaskTrigger -AtStartup
-$trigger1.Delay = "PT30S"
+# Trigger 1: Admin -> startup; Non-admin -> user logon
+if ($isElevated) {
+    Write-Host "Setting up Trigger 1: At startup (delay 30s)..." -ForegroundColor Yellow
+    $trigger1 = New-ScheduledTaskTrigger -AtStartup
+    $trigger1.Delay = "PT30S"
+}
+else {
+    Write-Host "Setting up Trigger 1: At logon (current user)..." -ForegroundColor Yellow
+    $trigger1 = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERNAME"
+}
 
 # 触发器2: 每天 00:05 刷新日出/日落
 Write-Host "Setting up Trigger 2: Daily 00:05 refresh..." -ForegroundColor Yellow
@@ -73,8 +87,13 @@ $settings = New-ScheduledTaskSettingsSet `
     -RunOnlyIfNetworkAvailable:$false `
     -ExecutionTimeLimit (New-TimeSpan -Hours 1)
 
-# 主体（使用当前用户，最高权限）
-$principal = New-ScheduledTaskPrincipal -UserId "$env:USERNAME" -LogonType Interactive -RunLevel Highest
+# Principal: Admin -> Highest; Non-admin -> Limited
+if ($isElevated) {
+    $principal = New-ScheduledTaskPrincipal -UserId "$env:USERNAME" -LogonType Interactive -RunLevel Highest
+}
+else {
+    $principal = New-ScheduledTaskPrincipal -UserId "$env:USERNAME" -LogonType Interactive -RunLevel Limited
+}
 
 # 注册任务
 Write-Host "Registering task..." -ForegroundColor Yellow
@@ -86,15 +105,16 @@ try {
         -Trigger $triggers `
         -Settings $settings `
         -Principal $principal `
-        -Description "Refresh sunrise/sunset schedule daily" | Out-Null
+        -Description "Refresh sunrise/sunset schedule daily" `
+        -ErrorAction Stop | Out-Null
     
     Write-Host ""
     Write-Host "SUCCESS! Task created successfully!" -ForegroundColor Green
     Write-Host ""
     
     # 验证任务
-    $task = Get-ScheduledTask -TaskName $refreshTaskName -TaskPath $taskPath
-    $taskInfo = Get-ScheduledTaskInfo -TaskName $refreshTaskName -TaskPath $taskPath
+    $task = Get-ScheduledTask -TaskName $refreshTaskName -TaskPath $taskPath -ErrorAction Stop
+    $taskInfo = Get-ScheduledTaskInfo -TaskName $refreshTaskName -TaskPath $taskPath -ErrorAction Stop
     
     Write-Host "Task Details:" -ForegroundColor Cyan
     Write-Host "  - Name: $refreshTaskName"
@@ -103,15 +123,25 @@ try {
     Write-Host "  - Triggers: $($task.Triggers.Count)"
     Write-Host ""
     
-    # 列出触发器
+    # List triggers
     Write-Host "Triggers:" -ForegroundColor Cyan
     $triggerIndex = 1
     foreach ($t in $task.Triggers) {
         if ($t.CimClass.CimClassName -eq "MSFT_TaskBootTrigger") {
             Write-Host "  $triggerIndex. At system startup (delay: $($t.Delay))"
         }
+        elseif ($t.CimClass.CimClassName -eq "MSFT_TaskLogonTrigger") {
+            Write-Host "  $triggerIndex. At user logon"
+        }
         elseif ($t.CimClass.CimClassName -eq "MSFT_TaskDailyTrigger") {
-            Write-Host "  $triggerIndex. Daily at $($t.StartBoundary.ToString('HH:mm'))"
+            $dailyAt = $t.StartBoundary
+            if ($dailyAt -is [datetime]) {
+                $dailyAt = $dailyAt.ToString('HH:mm')
+            }
+            else {
+                try { $dailyAt = ([datetime]$dailyAt).ToString('HH:mm') } catch {}
+            }
+            Write-Host "  $triggerIndex. Daily at $dailyAt"
         }
         $triggerIndex++
     }
@@ -138,7 +168,9 @@ try {
 catch {
     Write-Host ""
     Write-Host "ERROR: $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host "Please run as Administrator" -ForegroundColor Yellow
+    if (-not $isElevated) {
+        Write-Host "Tip: Admin is only required for startup-level (AtStartup) task." -ForegroundColor Yellow
+    }
 }
 
 Write-Host ""
