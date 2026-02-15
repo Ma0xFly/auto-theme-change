@@ -13,12 +13,19 @@ Write-Host ""
 
 $taskPath = '\AutoTheme\'
 $refreshTaskName = "AutoThemeSwitcher-Refresh"
+$autoTaskName = "AutoThemeSwitcher-Auto"
 $scriptPath = "$PSScriptRoot\UpdateSchedule.ps1"
+$autoScriptPath = "$PSScriptRoot\AutoThemeSwitcher.ps1"
 $isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
 # Check script exists
 if (-not (Test-Path $scriptPath)) {
     Write-Host "ERROR: Script not found: $scriptPath" -ForegroundColor Red
+    exit
+}
+
+if (-not (Test-Path $autoScriptPath)) {
+    Write-Host "ERROR: Script not found: $autoScriptPath" -ForegroundColor Red
     exit
 }
 
@@ -57,10 +64,20 @@ if ($existingTask) {
     Unregister-ScheduledTask -TaskName $refreshTaskName -TaskPath $taskPath -Confirm:$false
 }
 
+$existingAutoTask = Get-ScheduledTask -TaskName $autoTaskName -TaskPath $taskPath -ErrorAction SilentlyContinue
+if ($existingAutoTask) {
+    Write-Host "Removing existing auto task..." -ForegroundColor Yellow
+    Unregister-ScheduledTask -TaskName $autoTaskName -TaskPath $taskPath -Confirm:$false
+}
+
 # 创建任务操作
 $action = New-ScheduledTaskAction `
     -Execute "PowerShell.exe" `
     -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$scriptPath`""
+
+$autoAction = New-ScheduledTaskAction `
+    -Execute "PowerShell.exe" `
+    -Argument "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$autoScriptPath`" -Mode Auto"
 
 # Trigger 1: Admin -> startup; Non-admin -> user logon
 if ($isElevated) {
@@ -78,6 +95,7 @@ Write-Host "Setting up Trigger 2: Daily 00:05 refresh..." -ForegroundColor Yello
 $trigger2 = New-ScheduledTaskTrigger -Daily -At ([datetime]::Today.AddMinutes(5))
 
 $triggers = @($trigger1, $trigger2)
+$autoTriggers = @($trigger1)
 
 # 任务设置
 $settings = New-ScheduledTaskSettingsSet `
@@ -106,6 +124,16 @@ try {
         -Settings $settings `
         -Principal $principal `
         -Description "Refresh sunrise/sunset schedule daily" `
+        -ErrorAction Stop | Out-Null
+
+    Register-ScheduledTask `
+        -TaskName $autoTaskName `
+        -TaskPath $taskPath `
+        -Action $autoAction `
+        -Trigger $autoTriggers `
+        -Settings $settings `
+        -Principal $principal `
+        -Description "Run Auto theme catch-up at startup/logon" `
         -ErrorAction Stop | Out-Null
     
     Write-Host ""
@@ -150,8 +178,9 @@ try {
     Write-Host "Verification:" -ForegroundColor Cyan
     Write-Host "  1. Open Task Scheduler (Win+R -> taskschd.msc)"
     Write-Host "  2. Find task '$taskPath$refreshTaskName'"
-    Write-Host "  3. Check 'Triggers' tab"
-    Write-Host "  4. Check log: e:\auto_theme_change\ThemeSwitcher.log"
+    Write-Host "  3. Find task '$taskPath$autoTaskName'"
+    Write-Host "  4. Check 'Triggers' tab"
+    Write-Host "  5. Check log: e:\auto_theme_change\ThemeSwitcher.log"
     Write-Host ""
     
     if ($RunNow) {
