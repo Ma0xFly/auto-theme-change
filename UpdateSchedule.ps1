@@ -4,6 +4,7 @@
 # ============================================================================
 
 $LogFile = Join-Path $PSScriptRoot 'ThemeSwitcher.log'
+$SunTimesCacheFile = Join-Path $PSScriptRoot 'SunTimesCache.json'
 $MaxLogSize = 1MB
 $BeijingLatitude = 39.9042
 $BeijingLongitude = 116.4074
@@ -59,6 +60,81 @@ function Ensure-TaskFolder {
     }
 }
 
+function Save-SunriseSunsetCache {
+    param(
+        [DateTime]$Date,
+        [DateTime]$Sunrise,
+        [DateTime]$Sunset,
+        [string]$TimeZoneId
+    )
+
+    try {
+        $dateKey = $Date.ToString('yyyy-MM-dd')
+        $cache = [ordered]@{}
+
+        if (Test-Path $SunTimesCacheFile) {
+            $existingCache = Get-Content -Raw -Path $SunTimesCacheFile | ConvertFrom-Json
+            foreach ($property in $existingCache.PSObject.Properties) {
+                $cache[$property.Name] = $property.Value
+            }
+        }
+
+        $cache[$dateKey] = [ordered]@{
+            Sunrise    = $Sunrise.ToString('o')
+            Sunset     = $Sunset.ToString('o')
+            TimeZoneId = $TimeZoneId
+            UpdatedAt  = (Get-Date).ToString('o')
+        }
+
+        $cache | ConvertTo-Json | Set-Content -Path $SunTimesCacheFile -Encoding UTF8
+        Write-Log "Cached sunrise/sunset times for $dateKey"
+    }
+    catch {
+        Write-Log "Warning: Could not write sunrise/sunset cache - $($_.Exception.Message)"
+    }
+}
+
+function Get-CachedSunriseSunset {
+    param(
+        [DateTime]$Date,
+        [TimeZoneInfo]$TimeZone
+    )
+
+    try {
+        $dateKey = $Date.ToString('yyyy-MM-dd')
+
+        if (-not (Test-Path $SunTimesCacheFile)) {
+            Write-Log 'No sunrise/sunset cache found'
+            return $null
+        }
+
+        $cache = Get-Content -Raw -Path $SunTimesCacheFile | ConvertFrom-Json
+        $entry = $cache.PSObject.Properties[$dateKey].Value
+        if ($null -eq $entry) {
+            Write-Log "No cached sunrise/sunset times for $dateKey"
+            return $null
+        }
+
+        if ($entry.TimeZoneId -and $entry.TimeZoneId -ne $TimeZone.Id) {
+            Write-Log 'Cached sunrise/sunset time zone does not match'
+            return $null
+        }
+
+        $sunrise = [DateTime]::Parse($entry.Sunrise)
+        $sunset = [DateTime]::Parse($entry.Sunset)
+
+        Write-Log ('Using cached sunrise/sunset times: ' + $sunrise.ToString('HH:mm:ss') + ' / ' + $sunset.ToString('HH:mm:ss'))
+        return @{
+            Sunrise = $sunrise
+            Sunset  = $sunset
+        }
+    }
+    catch {
+        Write-Log "Warning: Could not read sunrise/sunset cache - $($_.Exception.Message)"
+        return $null
+    }
+}
+
 function Get-SunriseSunsetForDate {
     param(
         [double]$Latitude,
@@ -83,6 +159,7 @@ function Get-SunriseSunsetForDate {
 
             $sunriseLocal = [TimeZoneInfo]::ConvertTimeFromUtc($sunriseUtc, $TimeZone)
             $sunsetLocal = [TimeZoneInfo]::ConvertTimeFromUtc($sunsetUtc, $TimeZone)
+            Save-SunriseSunsetCache -Date $Date -Sunrise $sunriseLocal -Sunset $sunsetLocal -TimeZoneId $TimeZone.Id
 
             return @{
                 Sunrise = $sunriseLocal
@@ -180,10 +257,19 @@ Ensure-TaskFolder -Path $TaskPath
 $todayTimes = Get-SunriseSunsetForDate -Latitude $BeijingLatitude -Longitude $BeijingLongitude -Date $now -TimeZone $timeZone
 
 if ($null -eq $todayTimes) {
-    Write-Log 'Using fallback times: 07:00 / 18:00'
-    $nextTimes = Get-FallbackTimes -CurrentTime $now
-    $lightAt = $nextTimes.Sunrise
-    $darkAt = $nextTimes.Sunset
+    Write-Log 'Could not fetch sunrise/sunset times, trying cache'
+    $todayTimes = Get-CachedSunriseSunset -Date $now -TimeZone $timeZone
+
+    if ($null -eq $todayTimes) {
+        Write-Log 'Using fallback times: 07:00 / 18:00'
+        $nextTimes = Get-FallbackTimes -CurrentTime $now
+        $lightAt = $nextTimes.Sunrise
+        $darkAt = $nextTimes.Sunset
+    }
+    else {
+        $lightAt = $todayTimes.Sunrise
+        $darkAt = $todayTimes.Sunset
+    }
 }
 else {
     $lightAt = $todayTimes.Sunrise

@@ -12,6 +12,7 @@ Write-Host "=========================================" -ForegroundColor Cyan
 Write-Host ""
 
 $taskPath = '\AutoTheme\'
+$Backslash = [char]92
 $refreshTaskName = "AutoThemeSwitcher-Refresh"
 $autoTaskName = "AutoThemeSwitcher-Auto"
 $scriptPath = "$PSScriptRoot\UpdateSchedule.ps1"
@@ -37,9 +38,9 @@ function Ensure-TaskFolder {
         $service = New-Object -ComObject "Schedule.Service"
         $service.Connect()
         $root = $service.GetFolder('\')
-        $folderName = $Path.Trim('\\')
+        $folderName = $Path.Trim($Backslash)
         if ($folderName) {
-            try { $root.GetFolder('\\' + $folderName) | Out-Null }
+            try { $root.GetFolder(([string]$Backslash) + $folderName) | Out-Null }
             catch { $root.CreateFolder($folderName, $null) | Out-Null }
         }
 

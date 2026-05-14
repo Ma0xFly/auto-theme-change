@@ -11,6 +11,7 @@ param(
 
 # 配置参数
 $LogFile = "$PSScriptRoot\ThemeSwitcher.log"
+$SunTimesCacheFile = "$PSScriptRoot\SunTimesCache.json"
 $MaxLogSize = 1MB
 $BeijingLatitude = 39.9042
 $BeijingLongitude = 116.4074
@@ -44,6 +45,81 @@ function Get-ChinaTimeZone {
     }
 }
 
+function Save-SunriseSunsetCache {
+    param(
+        [DateTime]$Date,
+        [DateTime]$Sunrise,
+        [DateTime]$Sunset,
+        [string]$TimeZoneId
+    )
+
+    try {
+        $dateKey = $Date.ToString("yyyy-MM-dd")
+        $cache = [ordered]@{}
+
+        if (Test-Path $SunTimesCacheFile) {
+            $existingCache = Get-Content -Raw -Path $SunTimesCacheFile | ConvertFrom-Json
+            foreach ($property in $existingCache.PSObject.Properties) {
+                $cache[$property.Name] = $property.Value
+            }
+        }
+
+        $cache[$dateKey] = [ordered]@{
+            Sunrise    = $Sunrise.ToString("o")
+            Sunset     = $Sunset.ToString("o")
+            TimeZoneId = $TimeZoneId
+            UpdatedAt  = (Get-Date).ToString("o")
+        }
+
+        $cache | ConvertTo-Json | Set-Content -Path $SunTimesCacheFile -Encoding UTF8
+        Write-Log "已缓存 $dateKey 日出日落时间"
+    }
+    catch {
+        Write-Log "警告: 无法写入日出日落缓存 - $($_.Exception.Message)"
+    }
+}
+
+function Get-CachedSunriseSunset {
+    param(
+        [DateTime]$Date,
+        [TimeZoneInfo]$TimeZone
+    )
+
+    try {
+        $dateKey = $Date.ToString("yyyy-MM-dd")
+
+        if (-not (Test-Path $SunTimesCacheFile)) {
+            Write-Log "未找到日出日落缓存"
+            return $null
+        }
+
+        $cache = Get-Content -Raw -Path $SunTimesCacheFile | ConvertFrom-Json
+        $entry = $cache.PSObject.Properties[$dateKey].Value
+        if ($null -eq $entry) {
+            Write-Log "未找到 $dateKey 的日出日落缓存"
+            return $null
+        }
+
+        if ($entry.TimeZoneId -and $entry.TimeZoneId -ne $TimeZone.Id) {
+            Write-Log "日出日落缓存时区不匹配，跳过缓存"
+            return $null
+        }
+
+        $sunrise = [DateTime]::Parse($entry.Sunrise)
+        $sunset = [DateTime]::Parse($entry.Sunset)
+
+        Write-Log "使用缓存日出日落时间: 日出 $($sunrise.ToString('HH:mm:ss'))，日落 $($sunset.ToString('HH:mm:ss'))"
+        return @{
+            Sunrise = $sunrise
+            Sunset  = $sunset
+        }
+    }
+    catch {
+        Write-Log "警告: 无法读取日出日落缓存 - $($_.Exception.Message)"
+        return $null
+    }
+}
+
 # 获取日出日落时间
 function Get-SunriseSunset {
     param(
@@ -74,6 +150,7 @@ function Get-SunriseSunset {
             
             Write-Log "日出时间: $($sunriseLocal.ToString('HH:mm:ss'))"
             Write-Log "日落时间: $($sunsetLocal.ToString('HH:mm:ss'))"
+            Save-SunriseSunsetCache -Date $Date -Sunrise $sunriseLocal -Sunset $sunsetLocal -TimeZoneId $TimeZone.Id
             
             return @{
                 Sunrise = $sunriseLocal
@@ -91,8 +168,10 @@ function Get-SunriseSunset {
     }
 }
 
-# 尽力刷新主题（不重启资源管理器）
+# 尽力刷新主题；强刷新场景允许重启资源管理器作为任务栏兜底
 function Invoke-ThemeRefresh {
+    param([switch]$AllowExplorerRestart)
+
     try {
         $signature = @"
 using System;
@@ -126,6 +205,13 @@ public static class NativeMethods {
 
         Start-Process -FilePath "$env:SystemRoot\System32\rundll32.exe" -ArgumentList "user32.dll,UpdatePerUserSystemParameters" -WindowStyle Hidden -ErrorAction SilentlyContinue
         Write-Log "已尝试刷新主题设置（广播设置变更）"
+
+        if ($AllowExplorerRestart) {
+            Write-Log "强刷新: 重启 explorer.exe 以同步任务栏主题"
+            Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+            Start-Process -FilePath "$env:SystemRoot\explorer.exe" -ErrorAction SilentlyContinue
+        }
     }
     catch {
         Write-Log "警告: 刷新主题设置失败 - $($_.Exception.Message)"
@@ -155,7 +241,11 @@ function Get-CurrentTheme {
 
 # 设置 Windows 主题
 function Set-WindowsTheme {
-    param([bool]$IsLightMode)
+    param(
+        [bool]$IsLightMode,
+        [switch]$ForceRefresh,
+        [switch]$AllowExplorerRestart
+    )
     
     $regPath = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize"
     $themeValue = if ($IsLightMode) { 1 } else { 0 }
@@ -164,11 +254,13 @@ function Set-WindowsTheme {
     # 获取当前状态
     $currentTheme = Get-CurrentTheme
     
-    # 防抖动: 检查是否需要切换
+    $shouldWriteTheme = $true
+
+    # 防抖动: 检查是否需要写入
     if ($null -ne $currentTheme) {
         if ($currentTheme.System -eq $themeValue -and $currentTheme.Apps -eq $themeValue) {
-            Write-Log "当前已经是 $themeName 模式，无需切换"
-            return
+            $shouldWriteTheme = $false
+            Write-Log "当前已经是 $themeName 模式，无需写入注册表"
         }
     }
     
@@ -176,12 +268,19 @@ function Set-WindowsTheme {
         if (-not (Test-Path $regPath)) {
             New-Item -Path $regPath -Force | Out-Null
         }
-        
-        Set-ItemProperty -Path $regPath -Name "SystemUsesLightTheme" -Value $themeValue -Type DWord
-        Set-ItemProperty -Path $regPath -Name "AppsUseLightTheme" -Value $themeValue -Type DWord
-        
-        Write-Log "✓ 成功切换到 $themeName 模式"
-        Invoke-ThemeRefresh
+
+        if ($shouldWriteTheme) {
+            Set-ItemProperty -Path $regPath -Name "SystemUsesLightTheme" -Value $themeValue -Type DWord
+            Set-ItemProperty -Path $regPath -Name "AppsUseLightTheme" -Value $themeValue -Type DWord
+            Write-Log "✓ 成功切换到 $themeName 模式"
+            Invoke-ThemeRefresh -AllowExplorerRestart:$AllowExplorerRestart
+            return
+        }
+
+        if ($ForceRefresh) {
+            Write-Log "强制刷新当前 $themeName 模式外观"
+            Invoke-ThemeRefresh -AllowExplorerRestart:$AllowExplorerRestart
+        }
     }
     catch {
         Write-Log "错误: 无法设置主题 - $($_.Exception.Message)"
@@ -215,7 +314,11 @@ function Get-RecommendedTheme {
 
 # 使用保底逻辑（当 API 失败时）
 function Use-FallbackLogic {
-    param([DateTime]$CurrentTime)
+    param(
+        [DateTime]$CurrentTime,
+        [switch]$ForceRefresh,
+        [switch]$AllowExplorerRestart
+    )
     
     Write-Log "使用保底逻辑: 7:00 - 18:00 为浅色模式"
     
@@ -224,7 +327,7 @@ function Use-FallbackLogic {
     $fallbackSunset = $baseDate.AddHours(18)
     
     $isLightMode = Get-RecommendedTheme -Sunrise $fallbackSunrise -Sunset $fallbackSunset -CurrentTime $CurrentTime
-    Set-WindowsTheme -IsLightMode $isLightMode
+    Set-WindowsTheme -IsLightMode $isLightMode -ForceRefresh:$ForceRefresh -AllowExplorerRestart:$AllowExplorerRestart
 }
 
 # ============================================================================
@@ -253,13 +356,18 @@ if ($Mode -eq "Dark") {
 $sunTimes = Get-SunriseSunset -Latitude $BeijingLatitude -Longitude $BeijingLongitude -Date $currentTime -TimeZone $timeZone
 
 if ($null -eq $sunTimes) {
-    Write-Log "无法获取日出日落时间，使用保底逻辑"
-    Use-FallbackLogic -CurrentTime $currentTime
-    exit
+    Write-Log "无法获取日出日落时间，尝试使用缓存"
+    $sunTimes = Get-CachedSunriseSunset -Date $currentTime -TimeZone $timeZone
+
+    if ($null -eq $sunTimes) {
+        Write-Log "无法使用缓存日出日落时间，使用保底逻辑"
+        Use-FallbackLogic -CurrentTime $currentTime -ForceRefresh -AllowExplorerRestart
+        exit
+    }
 }
 
 $isLightMode = Get-RecommendedTheme -Sunrise $sunTimes.Sunrise -Sunset $sunTimes.Sunset -CurrentTime $currentTime
-Set-WindowsTheme -IsLightMode $isLightMode
+Set-WindowsTheme -IsLightMode $isLightMode -ForceRefresh -AllowExplorerRestart
 
 Write-Log "========================================="
 Write-Log "脚本执行完成"
